@@ -3,6 +3,30 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// Automatically reassemble golib.aar from split parts if needed
+val reassembleGolib = tasks.register("reassembleGolib") {
+    val targetAar = file("libs/golib.aar")
+    val parts = (0..10).map { i -> file("libs/golib.aar.p${String.format("%02d", i)}") }
+
+    inputs.files(parts.filter { it.exists() })
+    outputs.file(targetAar)
+
+    doLast {
+        if (!targetAar.exists() && parts.all { it.exists() }) {
+            targetAar.outputStream().use { out ->
+                parts.forEach { part ->
+                    part.inputStream().use { it.copyTo(out) }
+                }
+            }
+            logger.lifecycle("Successfully reassembled golib.aar from ${parts.size} parts.")
+        }
+    }
+}
+
+tasks.named("preBuild") {
+    dependsOn(reassembleGolib)
+}
+
 android {
     namespace = "io.libp2p.android"
     compileSdk = 35
