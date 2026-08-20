@@ -21,13 +21,18 @@ import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicReference
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import kotlin.math.ceil
 
 // ============================================================================
-// 1. P2P DATA MODELS, CONSTANTS & ENUMS
+// 1. P2P DATA MODELS, CONSTANTS, ENUMS & PROTOCOLS
 // ============================================================================
 
 /** Node lifecycle status */
@@ -38,14 +43,48 @@ enum class P2PNodeStatus {
     ERROR
 }
 
-/** P2P message types */
+/** P2P message classification */
 enum class P2PMessageType {
     DIRECT_MESSAGE,
     TOPIC_MESSAGE,
-    CHANNEL_MESSAGE
+    CHANNEL_MESSAGE,
+    DELIVERY_RECEIPT,
+    TYPING_INDICATOR,
+    PING_PONG
 }
 
-/** Peer connection event */
+/** Delivery / Read Receipt Status */
+enum class P2PReceiptStatus {
+    DELIVERED,
+    READ
+}
+
+/** Delivery receipt notification */
+data class P2PDeliveryReceipt(
+    val originalMessageId: String,
+    val senderPeerId: String,
+    val status: P2PReceiptStatus,
+    val timestamp: Long = System.currentTimeMillis()
+)
+
+/** Real-time typing event */
+data class P2PTypingEvent(
+    val peerId: String,
+    val isTyping: Boolean,
+    val topicName: String? = null,
+    val timestamp: Long = System.currentTimeMillis()
+)
+
+/** Live peer presence and latency round-trip telemetry */
+data class P2PPeerPresence(
+    val peerId: String,
+    val isOnline: Boolean = true,
+    val rttLatencyMs: Long? = null,
+    val multiaddresses: List<String> = emptyList(),
+    val lastSeen: Long = System.currentTimeMillis()
+)
+
+/** Peer connection lifecycle event */
 data class P2PPeerEvent(
     val peerId: String,
     val isConnected: Boolean,
@@ -58,7 +97,8 @@ data class P2PPeer(
     val peerId: String,
     val isConnected: Boolean = false,
     val multiaddresses: List<String> = emptyList(),
-    val lastSeen: Long = System.currentTimeMillis()
+    val lastSeen: Long = System.currentTimeMillis(),
+    val latencyMs: Long? = null
 )
 
 /** Incoming P2P message (text or chunked media) */
@@ -73,25 +113,33 @@ data class P2PIncomingMessage(
     val fileBytes: ByteArray? = null,
     val fileName: String? = null,
     val contentType: String? = null,
-    val fileSize: Long? = null
+    val fileSize: Long? = null,
+    val isEncrypted: Boolean = false
 ) {
     val isMediaMessage: Boolean get() = fileBytes != null
 }
 
 /** Internal P2P JSON wire message framing */
 data class P2PWireMessage(
-    val type: String,               // "dm", "topic", "channel"
-    val content: String,            // Plaintext content
-    val messageID: String,          // Unique message UUID
-    val senderNickname: String?,    // Sender display alias
-    val timestamp: Long,            // Unix epoch ms
+    val type: String,                       // "dm", "topic", "ack", "typing", "ping", "pong"
+    val content: String,                    // Plaintext content or payload
+    val messageID: String,                  // Unique message UUID
+    val senderNickname: String? = null,     // Sender display alias
+    val timestamp: Long = System.currentTimeMillis(),
+    // Media streaming fields
     val contentType: String? = null,
     val fileName: String? = null,
     val fileSize: Long? = null,
-    val chunkId: String? = null,    // Chunk transfer UUID
-    val chunkIndex: Int? = null,    // 0-based chunk index
-    val totalChunks: Int? = null,   // Total chunk count
-    val fileData: String? = null    // Base64 chunk bytes
+    val chunkId: String? = null,            // Chunk transfer UUID
+    val chunkIndex: Int? = null,            // 0-based chunk index
+    val totalChunks: Int? = null,           // Total chunk count
+    val fileData: String? = null,           // Base64 chunk bytes
+    // Feature extension fields (ACK, Typing, Ping, Encryption)
+    val ackMessageId: String? = null,       // Referenced message ID for delivery receipt
+    val ackStatus: String? = null,          // "delivered", "read"
+    val isTyping: Boolean? = null,          // Typing indicator state
+    val pingTimestamp: Long? = null,        // Latency measurement epoch ms
+    val isEncrypted: Boolean? = null        // E2EE payload flag
 )
 
 /** Live P2P bandwidth telemetry */
@@ -115,7 +163,8 @@ data class P2PTopicMessage(
     val content: String,
     val timestamp: Long = System.currentTimeMillis(),
     val isDirect: Boolean = false,
-    val messageID: String = UUID.randomUUID().toString()
+    val messageID: String = UUID.randomUUID().toString(),
+    val senderNickname: String? = null
 )
 
 /** P2P system constants */
@@ -129,6 +178,7 @@ object P2PConstants {
     const val DEFAULT_CHUNK_SIZE = 200 * 1024 // 200 KB
     const val CHUNK_TIMEOUT_MS = 30_000L
     const val STATUS_POLL_INTERVAL_MS = 5_000L
+    const val PING_TIMEOUT_MS = 10_000L
 
     val DEFAULT_BOOTSTRAP_NODES = listOf(
         "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
@@ -145,11 +195,84 @@ object P2PConstants {
 }
 
 // ============================================================================
-// 2. CHUNK ASSEMBLER (200 KB BINARY SLICES)
+// 2. END-TO-END ENCRYPTION (E2EE) SECURITY UTILITY
 // ============================================================================
 
 /**
- * Reassembles multi-chunk P2P binary media transfers with auto-expiration.
+ * Built-in AES-256-GCM cryptographic utility for optional End-to-End Encryption.
+ */
+object P2PCrypto {
+    private const val ALGORITHM = "AES/GCM/NoPadding"
+    private const val TAG_LENGTH_BIT = 128
+    private const val IV_LENGTH_BYTE = 12
+    private const val KEY_LENGTH_BYTE = 32 // 256 bits
+
+    /** Generate a secure random 256-bit AES key (Base64 encoded) */
+    fun generateKey(): String {
+        val keyGen = KeyGenerator.getInstance("AES")
+        keyGen.init(256, SecureRandom())
+        val secretKey = keyGen.generateKey()
+        return Base64.encodeToString(secretKey.encoded, Base64.NO_WRAP)
+    }
+
+    /** Encrypt plaintext string using AES-256-GCM */
+    fun encrypt(plainText: String, keyBase64: String): String {
+        return encryptBytes(plainText.toByteArray(Charsets.UTF_8), keyBase64)
+    }
+
+    /** Encrypt raw bytes using AES-256-GCM. Returns Base64 payload (IV + Ciphertext + Tag). */
+    fun encryptBytes(data: ByteArray, keyBase64: String): String {
+        val keyBytes = Base64.decode(keyBase64, Base64.NO_WRAP)
+        val secretKey: SecretKey = SecretKeySpec(keyBytes, "AES")
+
+        val iv = ByteArray(IV_LENGTH_BYTE)
+        SecureRandom().nextBytes(iv)
+
+        val cipher = Cipher.getInstance(ALGORITHM)
+        val spec = GCMParameterSpec(TAG_LENGTH_BIT, iv)
+        cipher.init(Cipher.ENCRYPT_MODE, secretKey, spec)
+
+        val cipherText = cipher.doFinal(data)
+        val combined = ByteArray(iv.size + cipherText.size)
+        System.arraycopy(iv, 0, combined, 0, iv.size)
+        System.arraycopy(cipherText, 0, combined, iv.size, cipherText.size)
+
+        return Base64.encodeToString(combined, Base64.NO_WRAP)
+    }
+
+    /** Decrypt Base64 payload string using AES-256-GCM */
+    fun decrypt(cipherTextBase64: String, keyBase64: String): String {
+        val decryptedBytes = decryptBytes(cipherTextBase64, keyBase64)
+        return String(decryptedBytes, Charsets.UTF_8)
+    }
+
+    /** Decrypt Base64 payload back to raw bytes */
+    fun decryptBytes(cipherTextBase64: String, keyBase64: String): ByteArray {
+        val keyBytes = Base64.decode(keyBase64, Base64.NO_WRAP)
+        val secretKey: SecretKey = SecretKeySpec(keyBytes, "AES")
+
+        val combined = Base64.decode(cipherTextBase64, Base64.NO_WRAP)
+        if (combined.size < IV_LENGTH_BYTE) throw IllegalArgumentException("Invalid ciphertext payload")
+
+        val iv = ByteArray(IV_LENGTH_BYTE)
+        val cipherText = ByteArray(combined.size - IV_LENGTH_BYTE)
+        System.arraycopy(combined, 0, iv, 0, IV_LENGTH_BYTE)
+        System.arraycopy(combined, IV_LENGTH_BYTE, cipherText, 0, cipherText.size)
+
+        val cipher = Cipher.getInstance(ALGORITHM)
+        val spec = GCMParameterSpec(TAG_LENGTH_BIT, iv)
+        cipher.init(Cipher.DECRYPT_MODE, secretKey, spec)
+
+        return cipher.doFinal(cipherText)
+    }
+}
+
+// ============================================================================
+// 3. CHUNK ASSEMBLER (200 KB BINARY SLICES WITH CANCELLATION)
+// ============================================================================
+
+/**
+ * Reassembles multi-chunk P2P binary media transfers with cancellation & auto-expiration.
  */
 class P2PChunkAssembler(
     private val timeoutMs: Long = P2PConstants.CHUNK_TIMEOUT_MS,
@@ -208,6 +331,14 @@ class P2PChunkAssembler(
         return null
     }
 
+    /** Cancel an in-flight transfer */
+    fun cancelTransfer(chunkId: String): Boolean {
+        return pending.remove(chunkId) != null
+    }
+
+    /** Check if transfer is currently in progress */
+    fun isTransferActive(chunkId: String): Boolean = pending.containsKey(chunkId)
+
     private fun cleanup() {
         val cutoff = System.currentTimeMillis() - timeoutMs
         val expired = pending.entries.filter { it.value.timestamp < cutoff }.map { it.key }
@@ -220,7 +351,7 @@ class P2PChunkAssembler(
 }
 
 // ============================================================================
-// 3. P2P CONFIGURATION MANAGER
+// 4. P2P CONFIGURATION MANAGER
 // ============================================================================
 
 /**
@@ -233,6 +364,7 @@ class P2PConfig(private val context: Context) {
         private const val KEY_ENABLE_RELAY = "enable_relay"
         private const val KEY_LISTEN_PORT = "listen_port"
         private const val KEY_BANDWIDTH_LIMIT = "bandwidth_limit"
+        private const val KEY_AUTO_RECONNECT = "auto_reconnect"
     }
 
     private val prefs: SharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -264,10 +396,13 @@ class P2PConfig(private val context: Context) {
 
     fun getBandwidthLimit(): Long = prefs.getLong(KEY_BANDWIDTH_LIMIT, 0L)
     fun setBandwidthLimit(limit: Long) = prefs.edit().putLong(KEY_BANDWIDTH_LIMIT, limit).apply()
+
+    fun isAutoReconnectEnabled(): Boolean = prefs.getBoolean(KEY_AUTO_RECONNECT, true)
+    fun setAutoReconnectEnabled(enabled: Boolean) = prefs.edit().putBoolean(KEY_AUTO_RECONNECT, enabled).apply()
 }
 
 // ============================================================================
-// 4. P2P ALIAS & FAVORITES REGISTRIES
+// 5. P2P ALIAS & FAVORITES REGISTRIES
 // ============================================================================
 
 /**
@@ -335,15 +470,17 @@ object P2PFavoritesRegistry {
         prefs?.edit()?.putStringSet("favorites", favorites.toSet())?.apply()
         return isNowFav
     }
+
+    fun getFavorites(): Set<String> = favorites.toSet()
 }
 
 // ============================================================================
-// 5. CORE P2P LIBRARY REPOSITORY (GO LIBP2P BRIDGE)
+// 6. CORE P2P LIBRARY REPOSITORY (GO LIBP2P BRIDGE & ADVANCED PROTOCOLS)
 // ============================================================================
 
 /**
  * Core P2P engine managing the Go libp2p node lifecycle, DHT discovery,
- * STUN/TURN ICE hole-punching, bandwidth telemetry, and callbacks.
+ * STUN/TURN ICE hole-punching, bandwidth telemetry, ping/pong, and delivery ACKs.
  */
 class P2PLibraryRepository(private val context: Context) {
     companion object {
@@ -384,7 +521,18 @@ class P2PLibraryRepository(private val context: Context) {
     private val _peerEvents = MutableSharedFlow<P2PPeerEvent>(extraBufferCapacity = 64)
     val peerEvents: SharedFlow<P2PPeerEvent> = _peerEvents.asSharedFlow()
 
+    // Enhanced Feature Flows
+    private val _deliveryReceipts = MutableSharedFlow<P2PDeliveryReceipt>(extraBufferCapacity = 64)
+    val deliveryReceipts: SharedFlow<P2PDeliveryReceipt> = _deliveryReceipts.asSharedFlow()
+
+    private val _typingEvents = MutableSharedFlow<P2PTypingEvent>(extraBufferCapacity = 64)
+    val typingEvents: SharedFlow<P2PTypingEvent> = _typingEvents.asSharedFlow()
+
+    private val _peerPresence = MutableStateFlow<Map<String, P2PPeerPresence>>(emptyMap())
+    val peerPresence: StateFlow<Map<String, P2PPeerPresence>> = _peerPresence.asStateFlow()
+
     private val peerAddressMap = ConcurrentHashMap<String, MutableSet<String>>()
+    private val pendingPings = ConcurrentHashMap<String, CompletableDeferred<Long>>()
 
     init {
         setupNetworkListener()
@@ -463,6 +611,7 @@ class P2PLibraryRepository(private val context: Context) {
                 _nodeStatus.value = P2PNodeStatus.STOPPED
                 _connectedPeers.value = emptyList()
                 _listenAddresses.value = emptyList()
+                _peerPresence.value = emptyMap()
 
                 Result.success(Unit)
             } catch (e: Throwable) {
@@ -531,17 +680,90 @@ class P2PLibraryRepository(private val context: Context) {
         }
     }
 
+    /**
+     * Send delivery or read receipt acknowledgment to a sender peer
+     */
+    suspend fun sendDeliveryReceipt(
+        targetPeerId: String,
+        originalMessageId: String,
+        status: P2PReceiptStatus = P2PReceiptStatus.DELIVERED
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        val wire = P2PWireMessage(
+            type = "ack",
+            content = "",
+            messageID = UUID.randomUUID().toString(),
+            ackMessageId = originalMessageId,
+            ackStatus = if (status == P2PReceiptStatus.DELIVERED) "delivered" else "read"
+        )
+        sendMessage(targetPeerId, gson.toJson(wire))
+    }
+
+    /**
+     * Send typing indicator to a target peer or topic room
+     */
+    suspend fun sendTypingIndicator(
+        targetPeerId: String,
+        isTyping: Boolean,
+        topicName: String? = null
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        val wire = P2PWireMessage(
+            type = "typing",
+            content = "",
+            messageID = UUID.randomUUID().toString(),
+            isTyping = isTyping
+        )
+        if (topicName != null) {
+            publishToTopic(topicName, gson.toJson(wire))
+        } else {
+            sendMessage(targetPeerId, gson.toJson(wire))
+        }
+    }
+
+    /**
+     * Measure Round-Trip Time (RTT) latency to a peer in milliseconds
+     */
+    suspend fun pingPeer(targetPeerId: String): Result<Long> = withContext(Dispatchers.IO) {
+        val pingId = UUID.randomUUID().toString()
+        val deferred = CompletableDeferred<Long>()
+        pendingPings[pingId] = deferred
+
+        val wire = P2PWireMessage(
+            type = "ping",
+            content = "",
+            messageID = pingId,
+            pingTimestamp = System.currentTimeMillis()
+        )
+
+        val sendRes = sendMessage(targetPeerId, gson.toJson(wire))
+        if (sendRes.isFailure) {
+            pendingPings.remove(pingId)
+            return@withContext Result.failure(sendRes.exceptionOrNull() ?: Exception("Ping send failed"))
+        }
+
+        try {
+            withTimeout(P2PConstants.PING_TIMEOUT_MS) {
+                val rtt = deferred.await()
+                updatePeerLatency(targetPeerId, rtt)
+                Result.success(rtt)
+            }
+        } catch (e: TimeoutCancellationException) {
+            pendingPings.remove(pingId)
+            Result.failure(Exception("Ping timed out to $targetPeerId"))
+        }
+    }
+
+    private fun updatePeerLatency(peerId: String, rtt: Long) {
+        val current = _peerPresence.value.toMutableMap()
+        val existing = current[peerId] ?: P2PPeerPresence(peerId = peerId)
+        current[peerId] = existing.copy(rttLatencyMs = rtt, lastSeen = System.currentTimeMillis())
+        _peerPresence.value = current
+    }
+
     private fun wireBridgeHandlers(node: P2PNode) {
         node.setMessageHandler(object : MobileMessageHandler {
             override fun handleMessage(senderPeerID: String, content: String) {
                 scope.launch {
-                    _incomingMessages.emit(
-                        P2PIncomingMessage(
-                            senderPeerID = senderPeerID,
-                            content = content,
-                            type = P2PMessageType.DIRECT_MESSAGE
-                        )
-                    )
+                    processIncomingPayload(senderPeerID, content, isTopic = false, topicName = null)
                 }
             }
         })
@@ -549,14 +771,7 @@ class P2PLibraryRepository(private val context: Context) {
         node.setTopicMessageHandler(object : MobileTopicMessageHandler {
             override fun handleTopicMessage(topicName: String, senderPeerID: String, content: String) {
                 scope.launch {
-                    _incomingMessages.emit(
-                        P2PIncomingMessage(
-                            senderPeerID = senderPeerID,
-                            content = content,
-                            type = P2PMessageType.TOPIC_MESSAGE,
-                            topicName = topicName
-                        )
-                    )
+                    processIncomingPayload(senderPeerID, content, isTopic = true, topicName = topicName)
                 }
             }
         })
@@ -567,6 +782,17 @@ class P2PLibraryRepository(private val context: Context) {
                     val addrs = peerAddressMap.getOrPut(peerID) { ConcurrentHashMap.newKeySet() }
                     if (remoteAddr.isNotBlank()) addrs.add(remoteAddr)
                     _peerEvents.emit(P2PPeerEvent(peerId = peerID, isConnected = true, multiaddress = remoteAddr))
+
+                    // Update presence
+                    val current = _peerPresence.value.toMutableMap()
+                    current[peerID] = P2PPeerPresence(
+                        peerId = peerID,
+                        isOnline = true,
+                        multiaddresses = addrs.toList(),
+                        lastSeen = System.currentTimeMillis()
+                    )
+                    _peerPresence.value = current
+
                     refreshState()
                 }
             }
@@ -574,6 +800,14 @@ class P2PLibraryRepository(private val context: Context) {
             override fun handlePeerDisconnected(peerID: String) {
                 scope.launch {
                     _peerEvents.emit(P2PPeerEvent(peerId = peerID, isConnected = false))
+
+                    // Update presence
+                    val current = _peerPresence.value.toMutableMap()
+                    current[peerID]?.let {
+                        current[peerID] = it.copy(isOnline = false, lastSeen = System.currentTimeMillis())
+                        _peerPresence.value = current
+                    }
+
                     refreshState()
                 }
             }
@@ -587,6 +821,77 @@ class P2PLibraryRepository(private val context: Context) {
                 }
             }
         })
+    }
+
+    private suspend fun processIncomingPayload(
+        senderPeerId: String,
+        rawPayload: String,
+        isTopic: Boolean,
+        topicName: String?
+    ) {
+        val wire: P2PWireMessage = try {
+            gson.fromJson(rawPayload, P2PWireMessage::class.java)
+        } catch (e: Exception) {
+            // Raw text fallback
+            P2PWireMessage(
+                type = if (isTopic) "topic" else "dm",
+                content = rawPayload,
+                messageID = UUID.randomUUID().toString(),
+                senderNickname = null
+            )
+        }
+
+        when (wire.type) {
+            "ack" -> {
+                val ackId = wire.ackMessageId ?: return
+                val status = if (wire.ackStatus == "read") P2PReceiptStatus.READ else P2PReceiptStatus.DELIVERED
+                _deliveryReceipts.emit(P2PDeliveryReceipt(originalMessageId = ackId, senderPeerId = senderPeerId, status = status))
+            }
+            "typing" -> {
+                val isTyping = wire.isTyping ?: false
+                _typingEvents.emit(P2PTypingEvent(peerId = senderPeerId, isTyping = isTyping, topicName = topicName))
+            }
+            "ping" -> {
+                // Auto-reply with pong
+                val pong = P2PWireMessage(
+                    type = "pong",
+                    content = "",
+                    messageID = wire.messageID,
+                    pingTimestamp = wire.pingTimestamp
+                )
+                sendMessage(senderPeerId, gson.toJson(pong))
+            }
+            "pong" -> {
+                val pingId = wire.messageID
+                val deferred = pendingPings.remove(pingId)
+                if (deferred != null && wire.pingTimestamp != null) {
+                    val rtt = System.currentTimeMillis() - wire.pingTimestamp
+                    deferred.complete(rtt)
+                }
+            }
+            else -> {
+                // Regular DM or Topic message
+                // Auto-send delivery ACK for direct messages
+                if (!isTopic) {
+                    scope.launch {
+                        sendDeliveryReceipt(senderPeerId, wire.messageID, P2PReceiptStatus.DELIVERED)
+                    }
+                }
+
+                _incomingMessages.emit(
+                    P2PIncomingMessage(
+                        senderPeerID = senderPeerId,
+                        content = rawPayload,
+                        type = if (isTopic) P2PMessageType.TOPIC_MESSAGE else P2PMessageType.DIRECT_MESSAGE,
+                        messageId = wire.messageID,
+                        topicName = topicName,
+                        timestamp = wire.timestamp,
+                        senderNickname = wire.senderNickname,
+                        isEncrypted = wire.isEncrypted ?: false
+                    )
+                )
+            }
+        }
     }
 
     private fun refreshState() {
@@ -649,21 +954,39 @@ class P2PLibraryRepository(private val context: Context) {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
         cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                scope.launch { if (_nodeStatus.value == P2PNodeStatus.RUNNING) refreshState() }
+                scope.launch {
+                    if (_nodeStatus.value == P2PNodeStatus.RUNNING) {
+                        refreshState()
+                        // Auto-reconnect to favorite peers if configured
+                        if (p2pConfig.isAutoReconnectEnabled()) {
+                            reconnectFavorites()
+                        }
+                    }
+                }
             }
             override fun onLost(network: Network) {
                 scope.launch { refreshState() }
             }
         })
     }
+
+    private suspend fun reconnectFavorites() {
+        val favs = P2PFavoritesRegistry.getFavorites()
+        for (fav in favs) {
+            val addrs = peerAddressMap[fav]
+            addrs?.firstOrNull()?.let { addr ->
+                try { connectToPeer(addr) } catch (e: Exception) { /* retry later */ }
+            }
+        }
+    }
 }
 
 // ============================================================================
-// 6. TOPICS REPOSITORY (GOSSIPSUB PUB/SUB)
+// 7. TOPICS REPOSITORY (GOSSIPSUB PUB/SUB WITH TYPING)
 // ============================================================================
 
 /**
- * Manages GossipSub topic subscriptions and multicast message streams.
+ * Manages GossipSub topic subscriptions, multicast message streams, and group typing indicators.
  */
 class P2PTopicsRepository(
     private val context: Context,
@@ -686,7 +1009,8 @@ class P2PTopicsRepository(
                         topicName = incoming.topicName!!,
                         senderPeerID = incoming.senderPeerID,
                         content = incoming.content,
-                        timestamp = incoming.timestamp
+                        timestamp = incoming.timestamp,
+                        senderNickname = incoming.senderNickname
                     )
                 )
             }
@@ -716,17 +1040,21 @@ class P2PTopicsRepository(
         return p2pRepository.publishToTopic(topicName, gson.toJson(wire))
     }
 
+    suspend fun sendTyping(topicName: String, isTyping: Boolean): Result<Unit> {
+        return p2pRepository.sendTypingIndicator(targetPeerId = "", isTyping = isTyping, topicName = topicName)
+    }
+
     fun isSubscribed(topicName: String): Boolean = subscribedTopics.contains(topicName)
     fun getSubscribedTopics(): Set<String> = subscribedTopics.toSet()
 }
 
 // ============================================================================
-// 7. P2P TRANSPORT & CHUNKED FILE COORDINATOR
+// 8. P2P TRANSPORT & CHUNKED FILE COORDINATOR
 // ============================================================================
 
 /**
- * High-level P2P Message and File Transfer Coordinator.
- * Handles automatic 200 KB chunking, reassembly, and message routing.
+ * High-level P2P Message, Media, ACK, and Encryption Coordinator.
+ * Handles automatic 200 KB chunking, reassembly, delivery ACKs, and latency pings.
  */
 class P2PTransport private constructor(private val context: Context) {
     companion object {
@@ -745,12 +1073,18 @@ class P2PTransport private constructor(private val context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val gson = Gson()
     private val chunkAssembler = P2PChunkAssembler()
+    private val activeTransfers = ConcurrentHashMap.newKeySet<String>()
 
     val repository: P2PLibraryRepository by lazy { P2PLibraryRepository(context) }
     val topics: P2PTopicsRepository by lazy { P2PTopicsRepository(context, repository) }
 
     private val _messages = MutableSharedFlow<P2PIncomingMessage>(extraBufferCapacity = 64)
     val messages: SharedFlow<P2PIncomingMessage> = _messages.asSharedFlow()
+
+    // Pass-through flows from repository
+    val deliveryReceipts: SharedFlow<P2PDeliveryReceipt> get() = repository.deliveryReceipts
+    val typingEvents: SharedFlow<P2PTypingEvent> get() = repository.typingEvents
+    val peerPresence: StateFlow<Map<String, P2PPeerPresence>> get() = repository.peerPresence
 
     init {
         P2PAliasRegistry.initialize(context)
@@ -784,7 +1118,28 @@ class P2PTransport private constructor(private val context: Context) {
         if (res.isSuccess) Result.success(messageId) else Result.failure(res.exceptionOrNull() ?: Exception("Send failed"))
     }
 
-    /** Stream binary file in 200 KB chunks */
+    /** Send encrypted direct text message (E2EE) */
+    suspend fun sendEncryptedDirectMessage(
+        targetPeerId: String,
+        text: String,
+        aesKeyBase64: String,
+        senderNickname: String? = null,
+        messageId: String = UUID.randomUUID().toString()
+    ): Result<String> = withContext(Dispatchers.IO) {
+        val encryptedContent = P2PCrypto.encrypt(text, aesKeyBase64)
+        val wire = P2PWireMessage(
+            type = "dm",
+            content = encryptedContent,
+            messageID = messageId,
+            senderNickname = senderNickname,
+            timestamp = System.currentTimeMillis(),
+            isEncrypted = true
+        )
+        val res = repository.sendMessage(targetPeerId, gson.toJson(wire))
+        if (res.isSuccess) Result.success(messageId) else Result.failure(res.exceptionOrNull() ?: Exception("Send failed"))
+    }
+
+    /** Stream binary file in 200 KB chunks with cancellation support */
     suspend fun sendDirectMedia(
         targetPeerId: String,
         fileName: String,
@@ -797,8 +1152,14 @@ class P2PTransport private constructor(private val context: Context) {
         val chunkSize = P2PConstants.DEFAULT_CHUNK_SIZE
         val totalChunks = ceil(fileBytes.size.toDouble() / chunkSize.toDouble()).toInt().coerceAtLeast(1)
 
+        activeTransfers.add(chunkId)
+
         try {
             for (i in 0 until totalChunks) {
+                if (!activeTransfers.contains(chunkId)) {
+                    return@withContext Result.failure(Exception("Transfer $chunkId cancelled"))
+                }
+
                 val start = i * chunkSize
                 val end = (start + chunkSize).coerceAtMost(fileBytes.size)
                 val slice = fileBytes.copyOfRange(start, end)
@@ -820,20 +1181,40 @@ class P2PTransport private constructor(private val context: Context) {
                 )
 
                 val sendRes = repository.sendMessage(targetPeerId, gson.toJson(wire))
-                if (sendRes.isFailure) return@withContext Result.failure(sendRes.exceptionOrNull() ?: Exception("Chunk send failed"))
+                if (sendRes.isFailure) {
+                    activeTransfers.remove(chunkId)
+                    return@withContext Result.failure(sendRes.exceptionOrNull() ?: Exception("Chunk send failed"))
+                }
                 onProgress?.invoke(i + 1, totalChunks)
             }
+            activeTransfers.remove(chunkId)
             Result.success(chunkId)
         } catch (e: Throwable) {
+            activeTransfers.remove(chunkId)
             Result.failure(e)
         }
     }
+
+    /** Cancel an active outgoing or incoming media transfer */
+    fun cancelMediaTransfer(chunkId: String) {
+        activeTransfers.remove(chunkId)
+        chunkAssembler.cancelTransfer(chunkId)
+    }
+
+    /** Send typing indicator */
+    suspend fun sendTyping(targetPeerId: String, isTyping: Boolean) = repository.sendTypingIndicator(targetPeerId, isTyping)
+
+    /** Send read receipt */
+    suspend fun sendReadReceipt(targetPeerId: String, originalMessageId: String) =
+        repository.sendDeliveryReceipt(targetPeerId, originalMessageId, P2PReceiptStatus.READ)
+
+    /** Ping peer for latency measurement */
+    suspend fun pingPeer(targetPeerId: String): Result<Long> = repository.pingPeer(targetPeerId)
 
     private suspend fun handleRawIncoming(raw: P2PIncomingMessage) {
         val wire: P2PWireMessage = try {
             gson.fromJson(raw.content, P2PWireMessage::class.java)
         } catch (e: Exception) {
-            // Raw text fallback
             P2PWireMessage(
                 type = if (raw.type == P2PMessageType.TOPIC_MESSAGE) "topic" else "dm",
                 content = raw.content,
@@ -886,7 +1267,8 @@ class P2PTransport private constructor(private val context: Context) {
                     messageId = wire.messageID,
                     topicName = raw.topicName,
                     timestamp = wire.timestamp,
-                    senderNickname = wire.senderNickname
+                    senderNickname = wire.senderNickname,
+                    isEncrypted = wire.isEncrypted ?: false
                 )
             )
         }
