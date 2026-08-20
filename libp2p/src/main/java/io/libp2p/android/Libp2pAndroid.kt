@@ -21,7 +21,10 @@ import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.Collections
+import java.util.LinkedHashMap
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Cipher
@@ -30,6 +33,9 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.math.ceil
+import kotlin.math.min
+import kotlin.math.pow
+import kotlin.random.Random
 
 // ============================================================================
 // 1. PUBLIC DATA MODELS & ENUMS
@@ -100,12 +106,13 @@ data class Libp2pMessage(
     val timestamp: Long = System.currentTimeMillis(),
     val isTopicMessage: Boolean = false,
     val topicName: String? = null,
-    // Media fields (null for standard text messages)
+    // Media fields
     val fileBytes: ByteArray? = null,
     val fileName: String? = null,
     val contentType: String? = null,
     val fileSize: Long? = null,
-    val isEncrypted: Boolean = false
+    val isEncrypted: Boolean = false,
+    val checksumSha256: String? = null
 ) {
     val isMediaMessage: Boolean get() = fileBytes != null
 }
@@ -151,18 +158,84 @@ data class Libp2pConfig(
 }
 
 // ============================================================================
-// 2. END-TO-END ENCRYPTION (E2EE) SECURITY UTILITY
+// 2. PRODUCTION MESSAGE DEDUPLICATION ENGINE (LRU + TTL)
 // ============================================================================
 
-/**
- * Built-in AES-256-GCM cryptographic utility for optional End-to-End Encryption.
- */
+/** Thread-safe LRU message deduplicator with sliding-window TTL */
+class Libp2pDeduplicator(
+    private val maxEntries: Int = 5_000,
+    private val ttlMs: Long = 10 * 60 * 1000L // 10 minutes
+) {
+    private val cache: MutableMap<String, Long> = Collections.synchronizedMap(
+        object : LinkedHashMap<String, Long>(maxEntries, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean {
+                return size > maxEntries
+            }
+        }
+    )
+
+    fun isNew(messageId: String): Boolean {
+        if (messageId.isBlank()) return true
+        val now = System.currentTimeMillis()
+        synchronized(cache) {
+            val previousTime = cache[messageId]
+            if (previousTime != null && (now - previousTime) < ttlMs) {
+                return false
+            }
+            cache[messageId] = now
+            return true
+        }
+    }
+
+    fun clear() {
+        cache.clear()
+    }
+}
+
+// ============================================================================
+// 3. EXPONENTIAL BACKOFF DIALER
+// ============================================================================
+
+/** Exponential backoff retry manager with randomized jitter */
+class Libp2pBackoffDialer(
+    private val initialDelayMs: Long = 1_000L,
+    private val maxDelayMs: Long = 30_000L,
+    private val multiplier: Double = 1.5,
+    private val jitterRatio: Double = 0.2
+) {
+    private val attemptCounters = ConcurrentHashMap<String, Int>()
+
+    fun getNextDelayMs(peerId: String): Long {
+        val attempt = attemptCounters.getOrDefault(peerId, 0)
+        attemptCounters[peerId] = attempt + 1
+
+        val calculated = initialDelayMs * multiplier.pow(attempt.toDouble())
+        val capped = min(calculated.toLong(), maxDelayMs)
+
+        val jitter = (capped * jitterRatio * Random.nextDouble(-1.0, 1.0)).toLong()
+        return (capped + jitter).coerceAtLeast(initialDelayMs)
+    }
+
+    fun reset(peerId: String) {
+        attemptCounters.remove(peerId)
+    }
+}
+
+// ============================================================================
+// 4. END-TO-END ENCRYPTION (E2EE) SECURITY UTILITY
+// ============================================================================
+
+/** Built-in AES-256-GCM cryptographic utility for optional End-to-End Encryption */
 object Libp2pCrypto {
     private const val ALGORITHM = "AES/GCM/NoPadding"
     private const val TAG_LENGTH_BIT = 128
     private const val IV_LENGTH_BYTE = 12
 
-    /** Generate a secure random 256-bit AES key (Base64 encoded) */
+    fun sha256(data: ByteArray): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(data)
+        return digest.joinToString("") { "%02x".format(it) }
+    }
+
     fun generateKey(): String {
         val keyGen = KeyGenerator.getInstance("AES")
         keyGen.init(256, SecureRandom())
@@ -170,12 +243,10 @@ object Libp2pCrypto {
         return Base64.encodeToString(secretKey.encoded, Base64.NO_WRAP)
     }
 
-    /** Encrypt plaintext string using AES-256-GCM */
     fun encrypt(plainText: String, keyBase64: String): String {
         return encryptBytes(plainText.toByteArray(Charsets.UTF_8), keyBase64)
     }
 
-    /** Encrypt raw bytes using AES-256-GCM. Returns Base64 payload (IV + Ciphertext + Tag). */
     fun encryptBytes(data: ByteArray, keyBase64: String): String {
         val keyBytes = Base64.decode(keyBase64, Base64.NO_WRAP)
         val secretKey: SecretKey = SecretKeySpec(keyBytes, "AES")
@@ -195,13 +266,11 @@ object Libp2pCrypto {
         return Base64.encodeToString(combined, Base64.NO_WRAP)
     }
 
-    /** Decrypt Base64 payload string using AES-256-GCM */
     fun decrypt(cipherTextBase64: String, keyBase64: String): String {
         val decryptedBytes = decryptBytes(cipherTextBase64, keyBase64)
         return String(decryptedBytes, Charsets.UTF_8)
     }
 
-    /** Decrypt Base64 payload back to raw bytes */
     fun decryptBytes(cipherTextBase64: String, keyBase64: String): ByteArray {
         val keyBytes = Base64.decode(keyBase64, Base64.NO_WRAP)
         val secretKey: SecretKey = SecretKeySpec(keyBytes, "AES")
@@ -223,22 +292,11 @@ object Libp2pCrypto {
 }
 
 // ============================================================================
-// 3. MAIN CLIENT ENTRY POINT (Libp2pClient)
+// 5. MAIN CLIENT ENTRY POINT (Libp2pClient)
 // ============================================================================
 
 /**
- * High-performance, production-ready libp2p client for Android applications.
- *
- * Provides:
- * - Direct peer-to-peer messaging (text and binary files with automatic chunking)
- * - Topic-based multicast pub/sub (GossipSub)
- * - Kademlia DHT peer discovery & bootstrap management
- * - ICE/STUN/TURN NAT hole-punching and Circuit Relay v2
- * - Delivery receipts (ACK) & Read status tracking
- * - Real-time typing indicators
- * - Peer heartbeat latency ping/pong (RTT in ms)
- * - Optional End-to-End Encryption (AES-256-GCM)
- * - Reactive Kotlin StateFlow and SharedFlow observability
+ * Enterprise-grade, production-ready libp2p client for Android applications.
  */
 class Libp2pClient private constructor(
     private val context: Context,
@@ -249,13 +307,14 @@ class Libp2pClient private constructor(
         private const val PREFS_NAME = "libp2p_client_prefs"
         private const val KEY_PRIVATE_KEY = "libp2p_private_key"
         private const val KEY_PEER_ID = "libp2p_peer_id"
-        private const val STATUS_REFRESH_INTERVAL_MS = 5_000L
         private const val PING_TIMEOUT_MS = 10_000L
+
+        const val POLL_INTERVAL_NORMAL_MS = 15_000L
+        const val POLL_INTERVAL_IDLE_MS = 45_000L
 
         @Volatile
         private var defaultInstance: Libp2pClient? = null
 
-        /** Get or initialize the default singleton instance */
         fun getInstance(context: Context, config: Libp2pConfig = Libp2pConfig()): Libp2pClient {
             return defaultInstance ?: synchronized(this) {
                 defaultInstance ?: Libp2pClient(context.applicationContext, config).also {
@@ -271,19 +330,16 @@ class Libp2pClient private constructor(
     private var node: P2PNode? = null
     private var statusRefreshJob: Job? = null
 
-    // Chunk reassembler for incoming multi-part files
+    private val deduplicator = Libp2pDeduplicator()
+    private val backoffDialer = Libp2pBackoffDialer()
     private val chunkAssembler = Libp2pChunkAssembler()
     private val activeTransfers = ConcurrentHashMap.newKeySet<String>()
 
-    // Shared preferences for key persistence
     private val prefs by lazy {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
 
-    // ------------------------------------------------------------------------
-    // Reactive Observables (Flows)
-    // ------------------------------------------------------------------------
-
+    // Reactive Observables
     private val _nodeStatus = MutableStateFlow(Libp2pNodeStatus.STOPPED)
     val nodeStatus: StateFlow<Libp2pNodeStatus> = _nodeStatus.asStateFlow()
 
@@ -305,7 +361,6 @@ class Libp2pClient private constructor(
     private val _peerEvents = MutableSharedFlow<Libp2pPeerEvent>(extraBufferCapacity = 64)
     val peerEvents: SharedFlow<Libp2pPeerEvent> = _peerEvents.asSharedFlow()
 
-    // Enhanced Feature Flows
     private val _deliveryReceipts = MutableSharedFlow<Libp2pDeliveryReceipt>(extraBufferCapacity = 64)
     val deliveryReceipts: SharedFlow<Libp2pDeliveryReceipt> = _deliveryReceipts.asSharedFlow()
 
@@ -315,10 +370,7 @@ class Libp2pClient private constructor(
     private val _peerPresence = MutableStateFlow<Map<String, Libp2pPeerPresence>>(emptyMap())
     val peerPresence: StateFlow<Map<String, Libp2pPeerPresence>> = _peerPresence.asStateFlow()
 
-    // Active topic subscriptions
     private val subscribedTopics = ConcurrentHashMap<String, MutableSharedFlow<Libp2pMessage>>()
-
-    // Known peer multiaddresses & pending pings
     private val peerAddressMap = ConcurrentHashMap<String, MutableSet<String>>()
     private val pendingPings = ConcurrentHashMap<String, CompletableDeferred<Long>>()
 
@@ -333,7 +385,6 @@ class Libp2pClient private constructor(
     // LIFECYCLE: START / STOP
     // ========================================================================
 
-    /** Start the libp2p node */
     suspend fun start(privateKeyBase64: String? = null): Result<String> = nodeLock.withLock {
         withContext(Dispatchers.IO) {
             if (_nodeStatus.value == Libp2pNodeStatus.RUNNING && node != null) {
@@ -384,7 +435,7 @@ class Libp2pClient private constructor(
                 _nodeStatus.value = Libp2pNodeStatus.RUNNING
 
                 refreshNodeState()
-                startStatusPoller()
+                startAdaptivePoller()
 
                 Log.i(TAG, "Libp2pClient started successfully. PeerID: $localPeerId")
                 Result.success(localPeerId)
@@ -396,7 +447,6 @@ class Libp2pClient private constructor(
         }
     }
 
-    /** Stop the libp2p node */
     suspend fun stop(): Result<Unit> = nodeLock.withLock {
         withContext(Dispatchers.IO) {
             try {
@@ -410,6 +460,7 @@ class Libp2pClient private constructor(
                 _connectedPeers.value = emptyList()
                 _listenAddresses.value = emptyList()
                 _peerPresence.value = emptyMap()
+                deduplicator.clear()
 
                 Log.i(TAG, "Libp2pClient stopped.")
                 Result.success(Unit)
@@ -424,7 +475,6 @@ class Libp2pClient private constructor(
     // DIRECT MESSAGING & MEDIA STREAMING
     // ========================================================================
 
-    /** Send direct text message */
     suspend fun sendDirectMessage(
         targetPeerId: String,
         text: String,
@@ -449,7 +499,6 @@ class Libp2pClient private constructor(
         }
     }
 
-    /** Send end-to-end encrypted direct text message */
     suspend fun sendEncryptedDirectMessage(
         targetPeerId: String,
         text: String,
@@ -477,7 +526,6 @@ class Libp2pClient private constructor(
         }
     }
 
-    /** Stream binary file with automatic chunking and cancellation support */
     suspend fun sendDirectMedia(
         targetPeerId: String,
         fileName: String,
@@ -490,6 +538,7 @@ class Libp2pClient private constructor(
         val chunkId = UUID.randomUUID().toString()
         val chunkSize = config.mediaChunkSizeBytes
         val totalChunks = ceil(fileBytes.size.toDouble() / chunkSize.toDouble()).toInt().coerceAtLeast(1)
+        val checksumSha256 = Libp2pCrypto.sha256(fileBytes)
 
         activeTransfers.add(chunkId)
 
@@ -516,7 +565,8 @@ class Libp2pClient private constructor(
                     chunkId = chunkId,
                     chunkIndex = index,
                     totalChunks = totalChunks,
-                    fileData = base64Data
+                    fileData = base64Data,
+                    checksumSha256 = checksumSha256
                 )
 
                 activeNode.sendMessage(targetPeerId, gson.toJson(wireChunk))
@@ -531,13 +581,11 @@ class Libp2pClient private constructor(
         }
     }
 
-    /** Cancel an active file transfer */
     fun cancelMediaTransfer(chunkId: String) {
         activeTransfers.remove(chunkId)
         chunkAssembler.cancelTransfer(chunkId)
     }
 
-    /** Send typing indicator */
     suspend fun sendTyping(targetPeerId: String, isTyping: Boolean, topicName: String? = null): Result<Unit> = withContext(Dispatchers.IO) {
         val activeNode = node ?: return@withContext Result.failure(IllegalStateException("Node not running"))
         val wire = Libp2pWireMessage(
@@ -558,7 +606,6 @@ class Libp2pClient private constructor(
         }
     }
 
-    /** Send read receipt */
     suspend fun sendReadReceipt(targetPeerId: String, originalMessageId: String): Result<Unit> = withContext(Dispatchers.IO) {
         val activeNode = node ?: return@withContext Result.failure(IllegalStateException("Node not running"))
         val wire = Libp2pWireMessage(
@@ -576,7 +623,6 @@ class Libp2pClient private constructor(
         }
     }
 
-    /** Measure round-trip latency (RTT) to peer in ms */
     suspend fun pingPeer(targetPeerId: String): Result<Long> = withContext(Dispatchers.IO) {
         val activeNode = node ?: return@withContext Result.failure(IllegalStateException("Node not running"))
         val pingId = UUID.randomUUID().toString()
@@ -731,6 +777,7 @@ class Libp2pClient private constructor(
                 scope.launch {
                     val addrs = peerAddressMap.getOrPut(peerID) { ConcurrentHashMap.newKeySet() }
                     if (remoteAddr.isNotBlank()) addrs.add(remoteAddr)
+                    backoffDialer.reset(peerID)
                     _peerEvents.emit(Libp2pPeerEvent(peerId = peerID, isConnected = true, multiaddress = remoteAddr))
 
                     val current = _peerPresence.value.toMutableMap()
@@ -788,6 +835,11 @@ class Libp2pClient private constructor(
             )
         }
 
+        // Deduplication check
+        if (!deduplicator.isNew(wire.messageID)) {
+            return
+        }
+
         when (wire.type) {
             "ack" -> {
                 val ackId = wire.ackMessageId ?: return
@@ -805,7 +857,7 @@ class Libp2pClient private constructor(
                     messageID = wire.messageID,
                     pingTimestamp = wire.pingTimestamp
                 )
-                node?.sendMessage(senderPeerId, gson.toJson(pong))
+                try { node?.sendMessage(senderPeerId, gson.toJson(pong)) } catch (e: Exception) { /* ignore */ }
             }
             "pong" -> {
                 val pingId = wire.messageID
@@ -844,7 +896,8 @@ class Libp2pClient private constructor(
                         totalChunks = wire.totalChunks,
                         contentType = wire.contentType ?: "application/octet-stream",
                         fileName = wire.fileName ?: "file.bin",
-                        chunkData = rawChunkBytes
+                        chunkData = rawChunkBytes,
+                        expectedChecksumSha256 = wire.checksumSha256
                     )
 
                     if (assembled != null) {
@@ -859,7 +912,8 @@ class Libp2pClient private constructor(
                             fileBytes = assembled.bytes,
                             fileName = assembled.fileName,
                             contentType = assembled.contentType,
-                            fileSize = assembled.bytes.size.toLong()
+                            fileSize = assembled.bytes.size.toLong(),
+                            checksumSha256 = wire.checksumSha256
                         )
                         dispatchMessage(fullMessage)
                     }
@@ -908,11 +962,16 @@ class Libp2pClient private constructor(
         }
     }
 
-    private fun startStatusPoller() {
+    private fun startAdaptivePoller() {
         statusRefreshJob?.cancel()
         statusRefreshJob = scope.launch {
             while (isActive) {
-                delay(STATUS_REFRESH_INTERVAL_MS)
+                val pollDelay = if (_connectedPeers.value.isNotEmpty()) {
+                    POLL_INTERVAL_NORMAL_MS
+                } else {
+                    POLL_INTERVAL_IDLE_MS
+                }
+                delay(pollDelay)
                 refreshNodeState()
                 pollBandwidthStats()
             }
@@ -963,7 +1022,7 @@ class Libp2pClient private constructor(
 }
 
 // ============================================================================
-// 4. INTERNAL WIRE MESSAGING & CHUNK ASSEMBLER
+// 6. INTERNAL WIRE MESSAGING & CHUNK ASSEMBLER
 // ============================================================================
 
 /** Internal JSON Wire Framing Format */
@@ -980,6 +1039,7 @@ data class Libp2pWireMessage(
     val chunkIndex: Int? = null,            // 0-based chunk index
     val totalChunks: Int? = null,           // Total chunk count
     val fileData: String? = null,           // Base64 chunk bytes
+    val checksumSha256: String? = null,     // SHA-256 digest
     val ackMessageId: String? = null,       // Delivery receipt reference
     val ackStatus: String? = null,          // "delivered", "read"
     val isTyping: Boolean? = null,          // Typing indicator state
@@ -987,7 +1047,7 @@ data class Libp2pWireMessage(
     val isEncrypted: Boolean? = null        // E2EE payload flag
 )
 
-/** Reassembles 200 KB multi-chunk binary media transfers with cancellation & auto-expiration */
+/** Reassembles 200 KB multi-chunk binary media transfers with SHA-256 integrity verification */
 class Libp2pChunkAssembler(
     private val timeoutMs: Long = 30_000L,
     private val cleanupIntervalMs: Long = 10_000L
@@ -996,13 +1056,19 @@ class Libp2pChunkAssembler(
         private const val TAG = "Libp2pChunkAssembler"
     }
 
-    data class AssembledMedia(val bytes: ByteArray, val contentType: String, val fileName: String)
+    data class AssembledMedia(
+        val bytes: ByteArray,
+        val contentType: String,
+        val fileName: String,
+        val checksumValid: Boolean = true
+    )
 
     private data class ChunkState(
         val chunks: MutableMap<Int, ByteArray> = mutableMapOf(),
         val contentType: String,
         val fileName: String,
         val totalChunks: Int,
+        val expectedChecksum: String? = null,
         val timestamp: Long = System.currentTimeMillis()
     )
 
@@ -1025,32 +1091,50 @@ class Libp2pChunkAssembler(
         totalChunks: Int,
         contentType: String,
         fileName: String,
-        chunkData: ByteArray
+        chunkData: ByteArray,
+        expectedChecksumSha256: String? = null
     ): AssembledMedia? {
         val state = pending.getOrPut(chunkId) {
-            ChunkState(contentType = contentType, fileName = fileName, totalChunks = totalChunks)
+            ChunkState(
+                contentType = contentType,
+                fileName = fileName,
+                totalChunks = totalChunks,
+                expectedChecksum = expectedChecksumSha256
+            )
         }
 
         synchronized(state.chunks) {
             state.chunks[chunkIndex] = chunkData
             if (state.chunks.size == totalChunks) {
-                val ordered = (0 until totalChunks).mapNotNull { i -> state.chunks[i] }
-                if (ordered.size < totalChunks) return null
-                val merged = ordered.reduce { acc, b -> acc + b }
+                var totalBytesCount = 0
+                for (i in 0 until totalChunks) {
+                    val piece = state.chunks[i] ?: return null
+                    totalBytesCount += piece.size
+                }
+
+                val merged = ByteArray(totalBytesCount)
+                var writeOffset = 0
+                for (i in 0 until totalChunks) {
+                    val piece = state.chunks[i]!!
+                    System.arraycopy(piece, 0, merged, writeOffset, piece.size)
+                    writeOffset += piece.size
+                }
+
                 pending.remove(chunkId)
-                Log.d(TAG, "Successfully reassembled $chunkId ($fileName, ${merged.size} bytes)")
-                return AssembledMedia(merged, state.contentType, state.fileName)
+
+                val checksumValid = if (!state.expectedChecksum.isNullOrBlank()) {
+                    val actualSha = Libp2pCrypto.sha256(merged)
+                    actualSha.equals(state.expectedChecksum, ignoreCase = true)
+                } else true
+
+                Log.d(TAG, "Successfully reassembled $chunkId ($fileName, ${merged.size} bytes, SHA-256: $checksumValid)")
+                return AssembledMedia(merged, state.contentType, state.fileName, checksumValid)
             }
         }
         return null
     }
 
-    /** Cancel an in-flight transfer */
-    fun cancelTransfer(chunkId: String): Boolean {
-        return pending.remove(chunkId) != null
-    }
-
-    /** Check if transfer is active */
+    fun cancelTransfer(chunkId: String): Boolean = pending.remove(chunkId) != null
     fun isTransferActive(chunkId: String): Boolean = pending.containsKey(chunkId)
 
     private fun cleanup() {
