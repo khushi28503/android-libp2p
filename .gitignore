@@ -18,6 +18,7 @@ local.properties
 
 # Module build outputs
 **/build/
+libp2p/libs/golib.aar
 
 # Signing
 *.jks
