@@ -4,37 +4,36 @@
 [![API](https://img.shields.io/badge/API-24%2B-brightgreen.svg)](https://android-arsenal.com/api?level=24)
 [![Platform](https://img.shields.io/badge/Platform-Android-green.svg)](https://developer.android.com)
 
-A high-performance, production-ready **peer-to-peer networking library and engine** for Android applications.  
+A high-performance, enterprise-ready **peer-to-peer networking engine and Android library**.  
 Built on [go-libp2p](https://github.com/libp2p/go-libp2p) and compiled for Android via [Gomobile](https://pkg.go.dev/golang.org/x/mobile/cmd/gomobile).
 
-**Zero servers. Zero accounts. 100% Peer-to-Peer.**
+**Zero servers. Zero centralized databases. 100% Direct P2P.**
 
 ---
 
-## ✨ Core & Advanced Features
+## ✨ Features
 
-| Feature | Description |
-|---|---|
-| 🔗 **Direct Messaging** | Unicast text messages over QUIC/TCP streams between peers |
-| 🔒 **End-to-End Encryption (E2EE)** | Built-in AES-256-GCM encryption helpers (`Libp2pCrypto`) |
-| 📩 **Delivery & Read Receipts** | WhatsApp-style ACK protocol (`DELIVERED` & `READ` status flows) |
-| ✍️ **Typing Indicators** | Transient real-time typing events for 1-on-1 and topic chats |
-| ⏱️ **Latency Ping / RTT** | Live peer connection pinging with Round-Trip Time measurement in ms |
-| 📡 **GossipSub Pub/Sub** | Scalable multicast group channels via epidemic gossip protocol |
-| 🔍 **DHT Discovery** | Find peers globally via Kademlia DHT and IPFS bootstrap nodes |
-| 🌐 **NAT Traversal** | ICE/STUN hole-punching with automatic Circuit Relay v2 fallback |
-| 🔄 **Smart Auto-Reconnect** | Automatic re-dialing with exponential backoff on network transitions |
-| 📦 **File Streaming & Cancel** | 200 KB chunked media transfer with live progress and cancel support |
-| 📊 **Bandwidth Telemetry** | Real-time upload/download rate monitoring via Kotlin StateFlows |
-| 📱 **Android Native** | minSdk 24, Kotlin coroutines, zero native build steps required |
+| Category | Feature | Description |
+|---|---|---|
+| 💬 **Messaging** | Direct Messaging | Unicast text & binary streams over QUIC/TCP |
+| 📬 **Reliability** | Persistent Outbox | Store-and-forward offline message queue with auto-flush on connect |
+| 👥 **Multicast** | Encrypted Group Rooms | GossipSub topic multicast with symmetric AES-256-GCM room keys |
+| 🎙️ **Rich Media** | Voice Note Streaming | Stream Opus/AAC voice notes with duration and waveform peaks |
+| 🛡️ **Security** | End-to-End Encryption | Built-in AES-256-GCM cipher suite (`Libp2pCrypto`) |
+| 📩 **Receipts** | Delivery & Read ACKs | WhatsApp-style message status tracking (`DELIVERED` & `READ`) |
+| ✍️ **Presence** | Typing Indicators | Real-time typing status for 1-on-1 and topic chats |
+| 📶 **Diagnostics** | Connection Health Score | Live signal health (0–100) & RTT latency in ms (`EXCELLENT` → `POOR`) |
+| 🌐 **Discovery** | Kademlia DHT | Global peer lookup & IPFS bootstrap integration |
+| 📦 **Transfers** | SHA-256 Verified Streaming | 200 KB chunked streaming with file integrity verification & cancellation |
+| ⚡ **Performance** | LRU Deduplication | Eliminates echo loops and duplicate packet triggers |
+| 🔄 **Resilience** | Exponential Backoff | Smart reconnect dialer with randomized jitter |
+| 🔋 **Efficiency** | Battery-Adaptive Polling | Adaptive 15s/45s polling to save mobile battery |
 
 ---
 
 ## 🚀 Quick Start
 
-### 1. Add the Library
-
-**Option A: Gradle Module (Recommended)**
+### 1. Add Library
 
 ```kotlin
 // settings.gradle.kts
@@ -46,115 +45,105 @@ dependencies {
 }
 ```
 
-**Option B: Standalone Pure Kotlin File**
-
-Copy `P2PSystem.kt` directly into your Android project source tree for a zero-wrapper, raw native P2P engine.
+Or copy `P2PSystem.kt` directly into your source tree for a zero-wrapper standalone engine.
 
 ---
 
 ## 💡 Code Examples
 
-### 1. Start a P2P Node
+### 1. Persistent Offline Message Delivery (Outbox)
 
 ```kotlin
 val client = Libp2pClient.getInstance(context)
 
 lifecycleScope.launch {
-    val peerId = client.start().getOrThrow()
-    Log.i("P2P", "My Peer ID: $peerId")
+    // Guarantees delivery: sends immediately if online, or queues locally and delivers the moment the peer reconnects!
+    client.sendDirectMessageQueued(
+        targetPeerId = "12D3KooW...",
+        text = "Hello! Delivered whenever you come back online."
+    )
 }
+
+// Observe pending outbox count
+client.pendingOutboxCount.onEach { count ->
+    Log.i("P2P", "Outbox pending: $count messages")
+}.launchIn(lifecycleScope)
 ```
 
-### 2. End-to-End Encrypted Direct Messaging (E2EE)
+### 2. Encrypted GossipSub Group Topic Rooms
 
 ```kotlin
-// Generate a 256-bit AES shared key or exchange via ECDH
-val sharedKey = Libp2pCrypto.generateKey()
+val roomKey = Libp2pCrypto.generateKey()
 
+// 1. Subscribe and automatically decrypt messages
+client.subscribeEncryptedTopic(topicName = "secret-squad", groupKeyBase64 = roomKey)
+    .onEach { message ->
+        Log.i("P2P", "Decrypted group chat: ${message.content}")
+    }
+    .launchIn(lifecycleScope)
+
+// 2. Publish encrypted message to group
 lifecycleScope.launch {
-    client.sendEncryptedDirectMessage(
-        targetPeerId = "12D3KooW...",
-        text = "Confidential P2P message",
-        aesKeyBase64 = sharedKey
+    client.publishEncryptedTopic(
+        topicName = "secret-squad",
+        text = "Confidential squad strategy update",
+        groupKeyBase64 = roomKey
     )
 }
 ```
 
-### 3. Delivery Receipts (Single/Double Checkmarks)
+### 3. Voice Note Streaming with Waveforms
 
 ```kotlin
-// Observe message delivery receipts
-client.deliveryReceipts.onEach { receipt ->
-    when (receipt.status) {
-        Libp2pReceiptStatus.DELIVERED -> Log.i("P2P", "Message ${receipt.originalMessageId} delivered! (✓✓)")
-        Libp2pReceiptStatus.READ -> Log.i("P2P", "Message ${receipt.originalMessageId} read! (✓✓ blue)")
-    }
-}.launchIn(lifecycleScope)
+val voiceBytes = File("/path/to/voice_note.opus").readBytes()
+val waveformPeaks = listOf(15, 45, 80, 95, 70, 30, 10) // 0-100 amplitude bars
 
-// Send read receipt when user opens chat
 lifecycleScope.launch {
-    client.sendReadReceipt(targetPeerId = "12D3KooW...", originalMessageId = "msg-123")
-}
-```
-
-### 4. Real-Time Typing Indicators
-
-```kotlin
-// Notify peer that user is typing
-lifecycleScope.launch {
-    client.sendTyping(targetPeerId = "12D3KooW...", isTyping = true)
+    client.sendVoiceNote(
+        targetPeerId = "12D3KooW...",
+        audioBytes = voiceBytes,
+        durationMs = 4500L,
+        waveformAmplitudes = waveformPeaks
+    )
 }
 
-// Observe typing state in UI
-client.typingEvents.onEach { event ->
-    if (event.isTyping) {
-        Log.i("P2P", "${event.peerId} is typing...")
+// Receiving voice notes
+client.incomingMessages.onEach { msg ->
+    if (msg.isVoiceNote) {
+        val meta = msg.voiceNoteMeta!!
+        Log.i("P2P", "Voice note received: ${meta.durationMs}ms with ${meta.waveformAmplitudes.size} waveform bars")
     }
 }.launchIn(lifecycleScope)
 ```
 
-### 5. Peer Latency Ping (RTT)
+### 4. Multi-Peer Parallel Broadcast
 
 ```kotlin
-lifecycleScope.launch {
-    val rttMs = client.pingPeer("12D3KooW...").getOrNull()
-    Log.i("P2P", "Ping latency: ${rttMs}ms")
-}
+val peerIds = listOf("12D3KooWA...", "12D3KooWB...", "12D3KooWC...")
 
-// Observe live presence & latency of connected peers
+lifecycleScope.launch {
+    val results = client.broadcastToPeers(peerIds, "Emergency Announcement!")
+    results.forEach { (peerId, result) ->
+        Log.i("P2P", "Peer $peerId delivery: ${result.isSuccess}")
+    }
+}
+```
+
+### 5. Connection Health & Latency Quality (0–100 Score)
+
+```kotlin
 client.peerPresence.onEach { presenceMap ->
     presenceMap.forEach { (peerId, presence) ->
-        Log.i("P2P", "Peer $peerId: Online=${presence.isOnline}, RTT=${presence.rttLatencyMs}ms")
+        Log.i("P2P", "Peer $peerId: Quality=${presence.quality}, Health=${presence.healthScore}/100, RTT=${presence.rttLatencyMs}ms")
     }
 }.launchIn(lifecycleScope)
-```
-
-### 6. Stream Files with Cancellation
-
-```kotlin
-val photoBytes = File("/path/to/photo.jpg").readBytes()
-
-lifecycleScope.launch {
-    val transferId = client.sendDirectMedia(
-        targetPeerId = "12D3KooW...",
-        fileName = "photo.jpg",
-        contentType = "image/jpeg",
-        fileBytes = photoBytes,
-        onProgress = { sent, total ->
-            Log.i("P2P", "Progress: ${sent * 100 / total}%")
-        }
-    ).getOrThrow()
-
-    // Cancel anytime if needed:
-    // client.cancelMediaTransfer(transferId)
-}
 ```
 
 ---
 
 ## 📖 API Reference
 
-### `Libp2pClient` Methods
+### `Libp2pClient` Public Methods
 
 | Method | Description |
 |---|---|
@@ -162,16 +151,21 @@ lifecycleScope.launch {
 | `start(privateKey?)` | Start P2P node, returns `Result<PeerId>` |
 | `stop()` | Stop node and release sockets |
 | `sendDirectMessage(peerId, text, nickname?)` | Send plaintext DM |
-| `sendEncryptedDirectMessage(peerId, text, aesKey, nickname?)` | Send AES-256-GCM encrypted DM |
-| `sendDirectMedia(peerId, name, type, bytes, nickname?, onProgress?)` | Stream file in 200 KB chunks |
+| `sendDirectMessageQueued(peerId, text, nickname?)` | Send message with offline outbox auto-flush |
+| `sendEncryptedDirectMessage(peerId, text, key, nickname?)` | Send AES-256-GCM encrypted DM |
+| `sendVoiceNote(peerId, bytes, duration, waveforms, nickname?)` | Stream voice note with waveform metadata |
+| `broadcastToPeers(peerIds, text, nickname?)` | Parallel broadcast to list of peers |
+| `sendDirectMedia(peerId, name, type, bytes, onProgress?)` | Stream file with SHA-256 verification |
 | `cancelMediaTransfer(chunkId)` | Abort active media transfer |
 | `sendTyping(peerId, isTyping, topicName?)` | Send typing status |
 | `sendReadReceipt(peerId, messageId)` | Send message read ACK |
 | `pingPeer(peerId)` | Measure round-trip latency in ms |
-| `subscribeTopic(name)` | Subscribe to GossipSub topic, returns `Flow<Message>` |
+| `subscribeTopic(name)` | Subscribe to GossipSub topic |
+| `subscribeEncryptedTopic(name, roomKey)` | Subscribe & auto-decrypt encrypted topic room |
 | `publishTopic(name, text, nickname?)` | Broadcast text to topic |
-| `connectPeer(multiaddr)` | Dial a peer directly |
-| `disconnectPeer(peerId)` | Disconnect a peer |
+| `publishEncryptedTopic(name, text, roomKey, nickname?)` | Broadcast ciphertext to topic |
+| `connectPeer(multiaddr)` | Dial peer directly |
+| `disconnectPeer(peerId)` | Disconnect peer |
 | `addBootstrapPeer(multiaddr)` | Add custom bootstrap node |
 
 ### Observable Flows
@@ -179,35 +173,14 @@ lifecycleScope.launch {
 | Flow | Type | Description |
 |---|---|---|
 | `nodeStatus` | `StateFlow<Libp2pNodeStatus>` | `STOPPED`, `STARTING`, `RUNNING`, `ERROR` |
-| `peerId` | `StateFlow<String?>` | Local peer ID |
-| `connectedPeers` | `StateFlow<List<String>>` | Actively connected peer IDs |
-| `listenAddresses` | `StateFlow<List<String>>` | Local listening multiaddresses |
-| `incomingMessages` | `SharedFlow<Libp2pMessage>` | Stream of incoming DMs and media |
+| `peerId` | `StateFlow<String?>` | Local cryptographic peer ID |
+| `connectedPeers` | `StateFlow<List<String>>` | Connected peer IDs |
+| `incomingMessages` | `SharedFlow<Libp2pMessage>` | Incoming DMs, media, and voice notes |
 | `deliveryReceipts` | `SharedFlow<Libp2pDeliveryReceipt>` | Live delivery and read ACKs |
 | `typingEvents` | `SharedFlow<Libp2pTypingEvent>` | Real-time typing indicators |
-| `peerPresence` | `StateFlow<Map<String, Libp2pPeerPresence>>` | Peer online status and RTT latency |
+| `peerPresence` | `StateFlow<Map<String, Libp2pPeerPresence>>` | Connection health score (0-100) & latency |
+| `pendingOutboxCount` | `StateFlow<Int>` | Count of queued offline messages |
 | `bandwidthStats` | `StateFlow<Libp2pBandwidthStats>` | Real-time transfer rates & telemetry |
-
----
-
-## ⚙️ Configuration Options
-
-```kotlin
-val config = Libp2pConfig(
-    listenPort = 0,                   // 0 = auto-assign
-    enableRelay = true,               // Circuit Relay v2 fallback
-    enableDht = true,                 // Kademlia DHT discovery
-    mediaChunkSizeBytes = 200 * 1024, // 200 KB chunks
-    autoReconnect = true,             // Auto-reconnect on network change
-    bandwidthLimitBytesPerSec = 0L,   // 0 = unlimited
-    bootstrapPeers = listOf(
-        "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"
-    ),
-    iceServers = listOf(
-        "stun:stun.l.google.com:19302"
-    )
-)
-```
 
 ---
 
@@ -218,12 +191,14 @@ val config = Libp2pConfig(
 ```
 
 Tests cover:
-- ✅ End-to-End Encryption (AES-256-GCM keygen, encrypt, decrypt, wrong-key failure)
-- ✅ Media Chunking & Transfer Cancellation
-- ✅ Delivery Receipt (ACK) Wire Serialization & Enums
-- ✅ Typing Indicator & Latency Ping/Pong Protocols
-- ✅ Configuration Defaults & Dynamic Overrides
-- ✅ Data Model Integrity
+- ✅ Persistent Outbox Queue & Auto-Flushing
+- ✅ Voice Note Waveform Preservation & Chunk Assembly
+- ✅ Encrypted GossipSub Group Rooms (AES-256-GCM)
+- ✅ Connection Health Quality Classification (0-100)
+- ✅ SHA-256 File Integrity Checksums
+- ✅ LRU Message Deduplication
+- ✅ Exponential Backoff with Jitter
+- ✅ Wire Message JSON Serialization
 
 ---
 
